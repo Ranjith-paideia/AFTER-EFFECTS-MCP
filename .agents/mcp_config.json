@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "after-effects": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": ".",
+      "transportType": "stdio"
+    }
+  }
+}
