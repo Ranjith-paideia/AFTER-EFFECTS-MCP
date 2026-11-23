@@ -1,7 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { runExtendScript } from "./aeBridge.js";
+import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { runExtendScript, captureFrameToPng } from "./aeBridge.js";
 import {
   inertia, wiggle, elasticSpring, staggerDelay, autoOrient,
   audioLink, autoResizeBox, autoResizeBoxPosition, loopCycle,
@@ -13,9 +17,87 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-async function executeTool(scriptBody: string): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+interface ToolEnvelope {
+  [key: string]: unknown;
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+  line?: number;
+  requestId?: string;
+}
+
+async function executeTool(scriptBody: string): Promise<{
+  content: Array<{ type: "text"; text: string }>;
+  structuredContent: ToolEnvelope;
+  isError: boolean;
+}> {
   const raw = await runExtendScript(scriptBody);
-  return { content: [{ type: "text" as const, text: raw }] };
+  let envelope: ToolEnvelope;
+  try {
+    envelope = JSON.parse(raw) as ToolEnvelope;
+  } catch (error) {
+    envelope = {
+      ok: false,
+      error: "Bridge returned invalid JSON: " + (error instanceof Error ? error.message : String(error)),
+    };
+  }
+  if (!envelope.ok) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(envelope) }],
+      structuredContent: envelope,
+      isError: true,
+    };
+  }
+  return {
+    content: [{ type: "text" as const, text: typeof envelope.data === "string"
+      ? envelope.data
+      : JSON.stringify(envelope.data ?? envelope) }],
+    structuredContent: envelope,
+    isError: false,
+  };
+}
+
+const toolOutputSchema = z.object({
+  ok: z.boolean(),
+  data: z.unknown().optional(),
+  error: z.string().optional(),
+  line: z.number().optional(),
+  requestId: z.string().optional(),
+});
+
+function registerCompatTool<T extends z.ZodRawShape>(
+  name: string,
+  description: string,
+  paramsSchema: T,
+  cb: (args: z.infer<z.ZodObject<T>>) => Promise<CallToolResult>,
+): void {
+  const readOnly = name === "get_project_info" ||
+    name === "get_composition_info" ||
+    name === "list_fonts" ||
+    name === "capture_frame_to_png";
+  const destructive = !readOnly &&
+    name !== "apply_expression" &&
+    name !== "apply_text_animator" &&
+    name !== "apply_shape_modifiers" &&
+    name !== "apply_effect_stack" &&
+    name !== "link_property_to_audio" &&
+    name !== "animate_transform_with_curves" &&
+    name !== "create_motion_path" &&
+    name !== "set_track_matte";
+  server.registerTool(name, {
+    description,
+    inputSchema: paramsSchema,
+    outputSchema: toolOutputSchema,
+    annotations: {
+      title: name,
+      readOnlyHint: readOnly,
+      destructiveHint: destructive,
+      idempotentHint: readOnly || name === "set_layer_properties" ||
+        name === "set_composition_renderer" ||
+        name === "set_track_matte",
+      openWorldHint: true,
+    },
+  }, cb as never);
 }
 
 function getCompScript(compName?: string): string {
@@ -27,7 +109,7 @@ function getCompScript(compName?: string): string {
 // Suite 1: Timeline, Project & Slate Management
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "create_composition",
   "Creates a new composition",
   {
@@ -58,7 +140,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "generate_scene_slate",
   "Generates a production slate with scene, take, and director info",
   {
@@ -96,7 +178,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "set_timeline_markers",
   "Sets composition timeline markers",
   {
@@ -124,7 +206,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_adjustment_layer",
   "Creates an adjustment layer in the composition",
   {
@@ -149,7 +231,7 @@ server.tool(
 // Suite 2: Advanced Keyframing, Curves & Easing
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "animate_transform_with_curves",
   "Animates a transform property with specified keyframes and easing curves",
   {
@@ -215,7 +297,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "separate_position_dimensions",
   "Separates the position dimensions (X, Y, Z) of a layer",
   {
@@ -231,7 +313,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_motion_path",
   "Creates a motion path animation with optional auto-orientation",
   {
@@ -268,7 +350,7 @@ server.tool(
 // Suite 3: Shape Layers, Vectors & HUD Accents
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "create_shape_with_trim_paths",
   "Creates a shape layer with trim paths applied",
   {
@@ -335,7 +417,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "generate_shape_repeater",
   "Generates a shape repeater setup",
   {
@@ -380,7 +462,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "apply_shape_modifiers",
   "Applies a vector modifier filter to a shape layer",
   {
@@ -419,7 +501,7 @@ server.tool(
 // Suite 4: Kinetic Typography & Subtitles
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "create_kinetic_text",
   "Creates styled text for kinetic typography",
   {
@@ -465,7 +547,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "apply_text_animator",
   "Applies a pre-configured text animator preset",
   {
@@ -521,7 +603,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "build_auto_resizing_subtitle_box",
   "Builds a text layer with a dynamic auto-resizing background box",
   {
@@ -580,7 +662,7 @@ server.tool(
 // Suite 5: 3D Systems, Camera Rigs & Hierarchy
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "build_master_null_rig",
   "Parents multiple target layers to a newly created Master Null",
   {
@@ -606,7 +688,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_camera_orbit_rig",
   "Creates a camera parented to a 3D null for orbit control",
   {
@@ -639,7 +721,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "add_expression_controllers",
   "Adds expression control effects to a layer",
   {
@@ -681,7 +763,7 @@ server.tool(
 // Suite 6: VFX, Transitions & Effect Parade
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "apply_effect_stack",
   "Applies a stack of effects with optional parameters to a layer",
   {
@@ -715,7 +797,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_displacement_glitch",
   "Creates a procedural glitch effect using displacement maps",
   {
@@ -749,7 +831,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_gradient_light_leak",
   "Generates a gradient ramp light leak layer",
   {
@@ -789,7 +871,7 @@ server.tool(
 // Suite 7: Audio Reactivity & Automation
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "convert_audio_to_keyframes",
   "Runs 'Convert Audio to Keyframes' command on an audio layer",
   {
@@ -807,7 +889,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "link_property_to_audio",
   "Links a property to audio keyframes using expressions",
   {
@@ -841,7 +923,7 @@ server.tool(
 // Suite 8: Render Queue & Raw Execution
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "add_to_render_queue",
   "Adds a composition to the Render Queue",
   {
@@ -863,13 +945,40 @@ server.tool(
   }
 );
 
-server.tool(
-  "execute_raw_extendscript",
+registerCompatTool(
+  "execute_extendscript",
   "Executes raw ExtendScript code directly. Use this as an escape hatch for arbitrary logic.",
   {
     script: z.string().describe("Raw ExtendScript code string to execute")
   },
   async (args) => {
+    if (process.env.AE_DISABLE_RAW_SCRIPT === "1") {
+      const envelope: ToolEnvelope = { ok: false, error: "Raw ExtendScript execution is disabled by AE_DISABLE_RAW_SCRIPT=1" };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(envelope) }],
+        structuredContent: envelope,
+        isError: true,
+      };
+    }
+    return executeTool(args.script);
+  }
+);
+
+registerCompatTool(
+  "execute_raw_extendscript",
+  "Compatibility alias for execute_extendscript.",
+  {
+    script: z.string().describe("Raw ExtendScript code string to execute")
+  },
+  async (args) => {
+    if (process.env.AE_DISABLE_RAW_SCRIPT === "1") {
+      const envelope: ToolEnvelope = { ok: false, error: "Raw ExtendScript execution is disabled by AE_DISABLE_RAW_SCRIPT=1" };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(envelope) }],
+        structuredContent: envelope,
+        isError: true,
+      };
+    }
     return executeTool(args.script);
   }
 );
@@ -878,7 +987,7 @@ server.tool(
 // Suite X: Additional Tools
 // ============================================================================
 
-server.tool(
+registerCompatTool(
   "get_project_info",
   "Gets basic information about the active project",
   {},
@@ -898,7 +1007,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "get_composition_info",
   "Gets detailed information about a composition",
   {
@@ -925,7 +1034,137 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
+  "list_fonts",
+  "Lists available After Effects fonts using app.fonts.allFonts",
+  {
+    search: z.string().optional().describe("Case-insensitive family, style, or PostScript name filter"),
+    limit: z.number().optional().default(50).describe("Maximum results (1-500)")
+  },
+  async (args) => {
+    const script = `
+      var limit = ${JSON.stringify(args.limit)};
+      if (limit < 1) limit = 1;
+      if (limit > 500) limit = 500;
+      var search = ${JSON.stringify(args.search || "")}.toLowerCase();
+      var fonts = [];
+      if (typeof app.fonts !== "undefined" && app.fonts.allFonts) {
+        var families = app.fonts.allFonts;
+        for (var i = 0; i < families.length && fonts.length < limit; i++) {
+          for (var j = 0; j < families[i].length && fonts.length < limit; j++) {
+            var f = families[i][j];
+            var familyName = f.familyName ? f.familyName : "";
+            var styleName = f.styleName ? f.styleName : "";
+            var postScriptName = f.postScriptName ? f.postScriptName : "";
+            var haystack = (familyName + " " + styleName + " " + postScriptName).toLowerCase();
+            if (!search || haystack.indexOf(search) !== -1) {
+              fonts.push({
+                familyName: familyName,
+                styleName: styleName,
+                postScriptName: postScriptName
+              });
+            }
+          }
+        }
+      }
+      JSON.stringify({ fonts: fonts, count: fonts.length });
+    `;
+    return executeTool(script);
+  }
+);
+
+registerCompatTool(
+  "set_composition_renderer",
+  "Sets the composition 3D renderer to a verified AE 2024 matchName",
+  {
+    compName: z.string().optional(),
+    renderer: z.enum(["classic_3d", "advanced_3d", "cinema_4d"]).describe("Friendly renderer name")
+  },
+  async (args) => {
+    const script = getCompScript(args.compName) + `
+      var targetMap = {
+        classic_3d: "ADBE Advanced 3d",
+        advanced_3d: "ADBE Calder",
+        cinema_4d: "ADBE Ernst"
+      };
+      var target = targetMap[` + JSON.stringify(args.renderer) + `];
+      var found = false;
+      for (var i = 0; i < comp.renderers.length; i++) {
+        if (comp.renderers[i] === target) found = true;
+      }
+      if (!found) throw new Error("Renderer matchName is unavailable: " + target);
+      comp.renderer = target;
+      JSON.stringify({ renderer: ` + JSON.stringify(args.renderer) + `, matchName: target });
+    `;
+    return executeTool(script);
+  }
+);
+
+registerCompatTool(
+  "set_track_matte",
+  "Sets or removes a track matte on a fill AVLayer",
+  {
+    compName: z.string().optional(),
+    fillLayerIndex: z.number().describe("1-based fill AVLayer index"),
+    matteLayerIndex: z.number().optional().describe("1-based matte AVLayer index"),
+    type: z.enum(["ALPHA", "ALPHA_INVERTED", "LUMA", "LUMA_INVERTED"]).optional().default("ALPHA"),
+    remove: z.boolean().optional().default(false)
+  },
+  async (args) => {
+    const script = getCompScript(args.compName) + `
+      var fill = comp.layer(${JSON.stringify(args.fillLayerIndex)});
+      if (!(fill instanceof AVLayer)) throw new Error("Fill layer is not an AVLayer");
+      if (${JSON.stringify(args.remove)}) {
+        fill.removeTrackMatte();
+      } else {
+        if (${args.matteLayerIndex === undefined ? "true" : "false"}) throw new Error("matteLayerIndex is required unless remove=true");
+        var matte = comp.layer(${JSON.stringify(args.matteLayerIndex)});
+        if (!(matte instanceof AVLayer)) throw new Error("Matte layer is not an AVLayer");
+        var typeMap = {
+          ALPHA: TrackMatteType.ALPHA,
+          ALPHA_INVERTED: TrackMatteType.ALPHA_INVERTED,
+          LUMA: TrackMatteType.LUMA,
+          LUMA_INVERTED: TrackMatteType.LUMA_INVERTED
+        };
+        fill.setTrackMatte(matte, typeMap[${JSON.stringify(args.type)}]);
+      }
+      JSON.stringify({
+        fillLayerIndex: fill.index,
+        matteLayerIndex: fill.trackMatteLayer ? fill.trackMatteLayer.index : null,
+        trackMatteType: fill.trackMatteType
+      });
+    `;
+    return executeTool(script);
+  }
+);
+
+registerCompatTool(
+  "capture_frame_to_png",
+  "Captures a composition frame as a validated native MCP PNG image",
+  {
+    compName: z.string().optional(),
+    time: z.number().describe("Time in seconds")
+  },
+  async (args) => {
+    const captured = await captureFrameToPng(args.compName, args.time);
+    if (!captured.ok) {
+      const envelope: ToolEnvelope = { ok: false, error: captured.error };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(envelope) }],
+        structuredContent: envelope,
+        isError: true,
+      };
+    }
+    const envelope: ToolEnvelope = { ok: true, data: { mimeType: "image/png" } };
+    return {
+      content: [{ type: "image" as const, data: captured.base64, mimeType: "image/png" }],
+      structuredContent: envelope,
+      isError: false,
+    };
+  }
+);
+
+registerCompatTool(
   "set_layer_properties",
   "Sets standard properties on a layer",
   {
@@ -959,13 +1198,29 @@ server.tool(
       if (props.outPoint !== undefined) layer.outPoint = props.outPoint;
       if (props.startTime !== undefined) layer.startTime = props.startTime;
       if (props.threeDLayer !== undefined) layer.threeDLayer = props.threeDLayer;
+      if (props.blendingMode !== undefined) {
+         var blendMap = {
+           normal: BlendingMode.NORMAL,
+           screen: BlendingMode.SCREEN,
+           add: BlendingMode.ADD,
+           overlay: BlendingMode.OVERLAY,
+           multiply: BlendingMode.MULTIPLY,
+           dissolve: BlendingMode.DISSOLVE,
+           darken: BlendingMode.DARKEN,
+           lighten: BlendingMode.LIGHTEN,
+           difference: BlendingMode.DIFFERENCE
+         };
+         var blendKey = String(props.blendingMode).toLowerCase();
+         if (blendMap[blendKey] !== undefined) layer.blendingMode = blendMap[blendKey];
+         else throw new Error("Unsupported blending mode: " + props.blendingMode);
+      }
       'Layer properties updated.';
     `;
     return executeTool(script);
   }
 );
 
-server.tool(
+registerCompatTool(
   "duplicate_layer",
   "Duplicates a layer in the composition one or more times",
   {
@@ -986,7 +1241,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "delete_layer",
   "Deletes a layer from the composition",
   {
@@ -1002,7 +1257,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "apply_expression",
   "Applies an expression string or preset to a property",
   {
@@ -1041,7 +1296,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerCompatTool(
   "create_solid_layer",
   "Creates a solid layer in the composition",
   {
@@ -1064,10 +1319,201 @@ server.tool(
   }
 );
 
+registerCompatTool(
+  "center_anchor_on_source_rect",
+  "Centers a text or shape layer anchor point without moving the layer on screen",
+  {
+    compName: z.string().optional(),
+    layerIndex: z.number().describe("1-based layer index"),
+    time: z.number().optional().default(0)
+  },
+  async (args) => {
+    const script = getCompScript(args.compName) + `
+      var layer = comp.layer(${JSON.stringify(args.layerIndex)});
+      var transform = layer.property("ADBE Transform Group");
+      var anchor = transform.property("ADBE Anchor Point");
+      var position = transform.property("ADBE Position");
+      var rect = layer.sourceRectAtTime(${JSON.stringify(args.time)}, false);
+      var newAnchor = [rect.left + rect.width / 2, rect.top + rect.height / 2];
+      var oldAnchor = anchor.value;
+      var oldPosition = position.value;
+      var delta = [
+        newAnchor[0] - oldAnchor[0],
+        newAnchor[1] - oldAnchor[1]
+      ];
+      var scaleProp = transform.property("ADBE Scale");
+      var scale = scaleProp ? scaleProp.value : [100, 100];
+      var localDx = delta[0] * scale[0] / 100;
+      var localDy = delta[1] * scale[1] / 100;
+      var rotationProp = transform.property("ADBE Rotation");
+      var angle = rotationProp ? rotationProp.value * Math.PI / 180 : 0;
+      var worldDx = localDx * Math.cos(angle) - localDy * Math.sin(angle);
+      var worldDy = localDx * Math.sin(angle) + localDy * Math.cos(angle);
+      anchor.setValue(newAnchor);
+      if (oldPosition.length === 2) {
+        position.setValue([oldPosition[0] + worldDx, oldPosition[1] + worldDy]);
+      } else {
+        position.setValue([oldPosition[0] + worldDx, oldPosition[1] + worldDy, oldPosition[2]]);
+      }
+      JSON.stringify({ anchor: newAnchor, position: position.value, sourceRect: rect });
+    `;
+    return executeTool(script);
+  }
+);
+
+server.registerResource(
+  "ae-project",
+  "ae://project",
+  {
+    title: "Active After Effects Project",
+    description: "Basic active-project state.",
+    mimeType: "application/json",
+  },
+  async () => {
+    const result = await executeTool(`
+      var p = app.project;
+      var res = {
+        name: p.file ? p.file.name : "Untitled",
+        path: p.file ? p.file.fsName : "Unsaved",
+        numItems: p.numItems,
+        activeItem: p.activeItem ? p.activeItem.name : "None",
+        aeVersion: app.version,
+        bitsPerChannel: p.bitsPerChannel
+      };
+      JSON.stringify(res);
+    `);
+    return { contents: [{ uri: "ae://project", mimeType: "application/json", text: result.content[0].text }] };
+  },
+);
+
+server.registerResource(
+  "ae-active-composition",
+  "ae://active-composition",
+  {
+    title: "Active Composition",
+    description: "Name, dimensions, frame rate, duration, renderer, and layers.",
+    mimeType: "application/json",
+  },
+  async () => {
+    const result = await executeTool(`
+      var comp = app.project.activeItem;
+      if (!(comp instanceof CompItem)) throw new Error("No active composition");
+      var layers = [];
+      for (var i = 1; i <= comp.numLayers; i++) {
+        var layer = comp.layer(i);
+        layers.push({ name: layer.name, index: layer.index, type: layer instanceof AVLayer ? "AVLayer" : "Layer" });
+      }
+      JSON.stringify({
+        name: comp.name,
+        width: comp.width,
+        height: comp.height,
+        fps: comp.frameRate,
+        duration: comp.duration,
+        renderer: comp.renderer,
+        numLayers: comp.numLayers,
+        layers: layers
+      });
+    `);
+    return { contents: [{ uri: "ae://active-composition", mimeType: "application/json", text: result.content[0].text }] };
+  },
+);
+
+server.registerResource(
+  "ae-rules",
+  "ae://rules/2024",
+  {
+    title: "After Effects 2024 MCP Rules",
+    description: "Verified runtime, matchName, renderer, and bridge rules.",
+    mimeType: "text/markdown",
+  },
+  async () => ({
+    contents: [{
+      uri: "ae://rules/2024",
+      mimeType: "text/markdown",
+      text: [
+        "# After Effects 2024",
+        "- Use ExtendScript ES3 syntax only.",
+        "- Address properties by matchName.",
+        '- Renderers: classic_3d="ADBE Advanced 3d", advanced_3d="ADBE Calder", cinema_4d="ADBE Ernst".',
+        "- Project bit depth is app.project.bitsPerChannel.",
+        "- saveFrameToPng is asynchronous; Node.js validates the complete PNG.",
+      ].join("\n"),
+    }],
+  }),
+);
+
+server.registerPrompt(
+  "ae2024-production-workflow",
+  {
+    title: "AE 2024 Production Workflow",
+    description: "Guidance for safe, studio-grade AE 2024 automation.",
+    argsSchema: {
+      goal: z.string().describe("Requested motion graphics or editing outcome"),
+    },
+  },
+  async (args) => ({
+    messages: [{
+      role: "user",
+      content: {
+        type: "text",
+        text:
+          "Use After Effects 2024 APIs and matchNames. Validate targets before mutation. " +
+          "Keep changes in one undo group. Return structured errors. Goal: " + args.goal,
+      },
+    }],
+  }),
+);
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("After Effects MCP server running on stdio");
+  const httpPortText = process.env.AE_MCP_HTTP_PORT;
+  if (httpPortText) {
+    const port = Number(httpPortText);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("AE_MCP_HTTP_PORT must be an integer between 1 and 65535");
+    }
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+    });
+    await server.connect(transport);
+    const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (req.url !== "/mcp") {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ ok: false, error: "Not found" }));
+        return;
+      }
+      if (req.method !== "POST" && req.method !== "GET" && req.method !== "DELETE") {
+        res.statusCode = 405;
+        res.setHeader("Allow", "GET, POST, DELETE");
+        res.end();
+        return;
+      }
+      let parsedBody: unknown;
+      if (req.method === "POST") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        try {
+          parsedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch (error) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: false, error: "Invalid JSON body" }));
+          return;
+        }
+      }
+      await transport.handleRequest(req, res, parsedBody);
+    });
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(port, "127.0.0.1", () => resolve());
+    });
+    console.error("After Effects MCP server running on Streamable HTTP at http://127.0.0.1:" + port + "/mcp");
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("After Effects MCP server running on stdio");
+  }
 }
 
 main().catch((err) => {
